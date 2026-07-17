@@ -67,7 +67,7 @@ The extension injects these as `PI_BEDROCK_PROFILE`, `PI_BEDROCK_REGION`, `AWS_P
 Start pi and switch to a Bedrock model:
 
 ```
-/model bedrock/ncino-sonnet
+/model bedrock/<model-name>
 ```
 
 Or use `Ctrl+P` to cycle models.
