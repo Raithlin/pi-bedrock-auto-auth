@@ -109,7 +109,7 @@ aws sso login --profile my-aws-profile
 
 ```json
 {
-  "defaultModel": "bedrock/ncino-sonnet",
+  "defaultModel": "bedrock/my-model",
   "bedrock": {
     "profile": "my-aws-profile",
     "region": "us-east-1"
