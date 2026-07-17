@@ -74,17 +74,38 @@ function resolveConfig(): { profile: string | undefined; region: string } {
 
 // ─── Auth-error detection ────────────────────────────────────────────────────
 
-/** Patterns that indicate an expired / missing AWS SSO token. */
+/**
+ * Patterns that indicate an expired / missing AWS SSO token.
+ *
+ * Two distinct failure modes:
+ *
+ * 1. SDK-level expiry — caught before the Bedrock request is made.
+ *    The CredentialsProviderError / TokenProviderError message surfaces directly
+ *    as the errorMessage. These have clear "SSO session", "Token is expired", etc.
+ *
+ * 2. Bedrock-level 403 with unread EventStream body — happens when the STS
+ *    role credentials expired or the SSO token was accepted by GetRoleCredentials
+ *    but the Bedrock service itself rejects them. formatBedrockError serialises
+ *    the unread $response.body stream object as JSON, producing internal Node.js
+ *    stream fields like "_events" and "_readableState" rather than an actual error
+ *    message. This is reliably distinct from a legitimate IAM permission denial,
+ *    which would have a JSON body containing a "message" key.
+ */
 const AUTH_ERROR_PATTERNS = [
+  // SDK-level SSO/token expiry (CredentialsProviderError / TokenProviderError)
   /token is expired/i,
   /aws sso login/i,
   /sso token/i,
-  /ExpiredToken/,
-  /UnauthorizedException/,
-  /InvalidIdentityToken/,
-  /not authorized to perform/i,
-  /No token available/i,
   /SSO session/i,
+  /No token available/i,
+  // Other SDK-level auth errors
+  /ExpiredToken/,
+  /InvalidIdentityToken/,
+  /UnauthorizedException/,
+  // Bedrock 403 where the response body is an unread EventStream (stream internals
+  // serialised by safeJsonStringify — not a real IAM permission-denied message)
+  /AccessDeniedException:.*403:.*"_events"/,
+  /AccessDeniedException:.*403:.*"_readableState"/,
 ];
 
 function isBedrockAuthError(errorMessage: string): boolean {
