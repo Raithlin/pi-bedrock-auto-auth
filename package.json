@@ -1,0 +1,24 @@
+{
+  "name": "pi-bedrock-auto-auth",
+  "version": "1.0.0",
+  "description": "Pi extension — automatic AWS SSO re-authentication for Bedrock providers",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "aws",
+    "bedrock",
+    "sso",
+    "extension"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Raithlin/pi-bedrock-auto-auth"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
