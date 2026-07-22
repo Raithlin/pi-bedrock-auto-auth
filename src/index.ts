@@ -1,10 +1,10 @@
 /**
  * bedrock-auto-auth
  *
- * Reads Bedrock/AWS config from ~/.pi/agent/settings.json under the "bedrock"
- * key, injects it into process.env so pi-provider-bedrock picks it up, and
- * watches for expired SSO tokens — automatically opening a browser auth URL
- * and re-submitting the last prompt once login completes.
+ * Single self-contained extension that:
+ * 1. Reads Bedrock/AWS config from ~/.pi/agent/settings.json ("bedrock" key)
+ * 2. Registers a "bedrock" provider with nCino and public models
+ * 3. Watches for expired SSO tokens and automatically re-authenticates
  *
  * ~/.pi/agent/settings.json:
  * {
@@ -14,17 +14,69 @@
  *   }
  * }
  *
- * The "profile" key is equivalent to PI_BEDROCK_PROFILE.
- * The "region" key is equivalent to PI_BEDROCK_REGION (default: "us-east-1").
- *
- * Env vars take precedence over settings.json so existing setups are unaffected.
+ * Env vars (PI_BEDROCK_PROFILE, PI_BEDROCK_REGION) take precedence over settings.json.
  */
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
+import { getApiProvider } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const PROVIDER = "bedrock";
+const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+
+const BEDROCK_MODELS: Array<{
+  id: string;
+  name: string;
+  bedrockId: string;
+  contextWindow: number;
+  maxTokens: number;
+  forceCache?: boolean;
+}> = [
+  {
+    id: "ncino-sonnet",
+    name: "Sonnet (nCino)",
+    bedrockId: "arn:aws:bedrock:us-east-1:714322698969:application-inference-profile/9kj0csdyqyvq",
+    contextWindow: 200000,
+    maxTokens: 16000,
+    forceCache: true,
+  },
+  {
+    id: "ncino-opus",
+    name: "Opus (nCino)",
+    bedrockId: "arn:aws:bedrock:us-east-1:714322698969:application-inference-profile/n0e3heu53j8f",
+    contextWindow: 200000,
+    maxTokens: 32000,
+    forceCache: true,
+  },
+  {
+    id: "ncino-haiku",
+    name: "Haiku (nCino)",
+    bedrockId: "arn:aws:bedrock:us-east-1:714322698969:application-inference-profile/1267pweyv7t9",
+    contextWindow: 200000,
+    maxTokens: 8096,
+    forceCache: true,
+  },
+  {
+    id: "claude-opus-4-6",
+    name: "Claude Opus 4.6 1M (Bedrock)",
+    bedrockId: "us.anthropic.claude-opus-4-6-v1",
+    contextWindow: 1000000,
+    maxTokens: 128000,
+  },
+  {
+    id: "claude-sonnet-4-6",
+    name: "Claude Sonnet 4.6 1M (Bedrock)",
+    bedrockId: "us.anthropic.claude-sonnet-4-6",
+    contextWindow: 1000000,
+    maxTokens: 64000,
+  },
+];
 
 // ─── Config loading ──────────────────────────────────────────────────────────
 
@@ -55,7 +107,7 @@ function resolveConfig(): { profile: string | undefined; region: string } {
   const profile = process.env.PI_BEDROCK_PROFILE ?? fromSettings.profile;
   const region = process.env.PI_BEDROCK_REGION ?? fromSettings.region ?? "us-east-1";
 
-  // Inject into process.env so pi-provider-bedrock picks them up
+  // Inject into process.env so the built-in bedrock API provider picks them up
   if (profile && !process.env.PI_BEDROCK_PROFILE) {
     process.env.PI_BEDROCK_PROFILE = profile;
   }
@@ -72,27 +124,48 @@ function resolveConfig(): { profile: string | undefined; region: string } {
   return { profile, region };
 }
 
+// ─── Provider registration ───────────────────────────────────────────────────
+
+function streamBedrock(
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  const provider = getApiProvider("bedrock-converse-stream");
+  if (!provider) throw new Error("Bedrock API provider not registered");
+
+  const profile = process.env.PI_BEDROCK_PROFILE;
+  const region = process.env.PI_BEDROCK_REGION || "us-east-1";
+
+  const entry = BEDROCK_MODELS.find((m) => m.id === model.id);
+  if (!entry) throw new Error(`No bedrock mapping for ${model.id}`);
+
+  const bedrockModel: Model<Api> = {
+    id: entry.bedrockId,
+    name: entry.name,
+    api: "bedrock-converse-stream" as Api,
+    provider: "amazon-bedrock",
+    baseUrl: `https://bedrock-runtime.${region}.amazonaws.com`,
+    reasoning: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: entry.contextWindow,
+    maxTokens: entry.maxTokens,
+  };
+
+  if (entry.forceCache) process.env.AWS_BEDROCK_FORCE_CACHE = "1";
+
+  return provider.stream(bedrockModel, context, {
+    ...(options ?? {}),
+    profile,
+    region,
+  } as Record<string, unknown>);
+}
+
 // ─── Auth-error detection ────────────────────────────────────────────────────
 
-/**
- * Patterns that indicate an expired / missing AWS SSO token.
- *
- * Two distinct failure modes:
- *
- * 1. SDK-level expiry — caught before the Bedrock request is made.
- *    The CredentialsProviderError / TokenProviderError message surfaces directly
- *    as the errorMessage. These have clear "SSO session", "Token is expired", etc.
- *
- * 2. Bedrock-level 403 with unread EventStream body — happens when the STS
- *    role credentials expired or the SSO token was accepted by GetRoleCredentials
- *    but the Bedrock service itself rejects them. formatBedrockError serialises
- *    the unread $response.body stream object as JSON, producing internal Node.js
- *    stream fields like "_events" and "_readableState" rather than an actual error
- *    message. This is reliably distinct from a legitimate IAM permission denial,
- *    which would have a JSON body containing a "message" key.
- */
 const AUTH_ERROR_PATTERNS = [
-  // SDK-level SSO/token expiry (CredentialsProviderError / TokenProviderError)
+  // SDK-level SSO/token expiry
   /token is expired/i,
   /aws sso login/i,
   /sso token/i,
@@ -102,8 +175,7 @@ const AUTH_ERROR_PATTERNS = [
   /ExpiredToken/,
   /InvalidIdentityToken/,
   /UnauthorizedException/,
-  // Bedrock 403 where the response body is an unread EventStream (stream internals
-  // serialised by safeJsonStringify — not a real IAM permission-denied message)
+  // Bedrock 403 with unread EventStream body (stream internals serialised)
   /AccessDeniedException:.*403:.*"_events"/,
   /AccessDeniedException:.*403:.*"_readableState"/,
 ];
@@ -116,13 +188,18 @@ function isBedrockAuthError(errorMessage: string): boolean {
 
 /**
  * Run `aws sso login --profile <profile> --no-browser`.
- * Returns the authorization URL from stdout/stderr, or null if not found.
+ * Calls `onUrl` as soon as the authorization URL is detected so the caller
+ * can open the browser immediately (the login process blocks waiting for
+ * the user to authenticate before it exits).
  * Resolves when the login subprocess exits.
  */
-function runSsoLogin(profile: string): Promise<{ url: string | null; exitCode: number }> {
+function runSsoLogin(
+  profile: string,
+  onUrl?: (url: string) => void,
+): Promise<{ url: string | null; exitCode: number }> {
   return new Promise((resolve) => {
     let url: string | null = null;
-    const urlPattern = /https:\/\/oidc\.[^\s]+/;
+    const urlPattern = /https:\/\/[^\s]+/;
 
     const child = spawn("aws", ["sso", "login", "--profile", profile, "--no-browser"], {
       env: process.env,
@@ -132,7 +209,10 @@ function runSsoLogin(profile: string): Promise<{ url: string | null; exitCode: n
     function scanLine(line: string) {
       if (!url) {
         const match = line.match(urlPattern);
-        if (match) url = match[0];
+        if (match) {
+          url = match[0];
+          onUrl?.(url);
+        }
       }
     }
 
@@ -164,19 +244,37 @@ function openUrl(url: string): void {
 // ─── Extension entry point ───────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // Resolve config at load time so pi-provider-bedrock gets the env vars in time
-  const { profile } = resolveConfig();
+  // Resolve config at load time
+  const { profile, region } = resolveConfig();
 
   if (!profile) return; // No Bedrock config — nothing to do
 
-  // Track the last user prompt so we can re-submit it after login
+  // ── Register the provider ──────────────────────────────────────────────────
+
+  pi.registerProvider(PROVIDER, {
+    api: `${PROVIDER}-api` as Api,
+    baseUrl: `https://bedrock-runtime.${region}.amazonaws.com`,
+    apiKey: "aws-profile-auth",
+    models: BEDROCK_MODELS.map((m) => ({
+      id: m.id,
+      name: m.name,
+      reasoning: true,
+      input: ["text", "image"] as ("text" | "image")[],
+      cost: ZERO_COST,
+      contextWindow: m.contextWindow,
+      maxTokens: m.maxTokens,
+    })),
+    streamSimple: streamBedrock,
+  });
+
+  // ── Auto-auth on SSO token expiry ──────────────────────────────────────────
+
   let lastUserPrompt: string | null = null;
 
   pi.on("before_agent_start", (event) => {
     lastUserPrompt = event.prompt ?? null;
   });
 
-  // Prevent re-entrant login flows
   let loginInProgress = false;
 
   pi.on("message_end", async (event, ctx) => {
@@ -195,12 +293,12 @@ export default function (pi: ExtensionAPI) {
         "warning",
       );
 
-      const { url, exitCode } = await runSsoLogin(profile);
+      const { url, exitCode } = await runSsoLogin(profile, (detectedUrl) => {
+        openUrl(detectedUrl);
+        ctx.ui.notify(`🌐 Opening browser for AWS SSO login.\nURL: ${detectedUrl}`, "info");
+      });
 
-      if (url) {
-        openUrl(url);
-        ctx.ui.notify(`🌐 Opening browser for AWS SSO login.\nURL: ${url}`, "info");
-      } else {
+      if (!url) {
         ctx.ui.notify(
           `⚠️  Could not extract authorization URL. ` +
             `Run manually: aws sso login --profile ${profile}`,
