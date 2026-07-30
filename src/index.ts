@@ -155,8 +155,17 @@ function streamBedrock(
 
   if (entry.forceCache) process.env.AWS_BEDROCK_FORCE_CACHE = "1";
 
+  // options.apiKey is the "aws-profile-auth" placeholder passed to
+  // registerProvider() below (needed only to satisfy pi's "some auth method
+  // configured" check). The shared bedrock-converse-stream implementation
+  // treats any truthy apiKey as a bearer token, so without stripping it here
+  // that literal placeholder gets sent to AWS as a bearer token and rejected
+  // ("Invalid API Key format"). Real auth is AWS_PROFILE/SSO, so drop it and
+  // let the request fall through to the SDK credential chain.
+  const { apiKey: _placeholderApiKey, ...restOptions } = options ?? {};
+
   return provider.stream(bedrockModel, context, {
-    ...(options ?? {}),
+    ...restOptions,
     profile,
     region,
   } as Record<string, unknown>);
